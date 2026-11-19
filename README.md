@@ -25,19 +25,11 @@ Several techniques are used to improve generalisation and performance:
 - **Optimisation:** AdamW optimiser with a One-Cycle learning rate scheduler.
 - **Test-Time Augmentation:** Horizontal flipping during inference.
 
-## Adapting to Your Face
+### Custom Facial Expression Data
 
-FER2013's "sad" examples are mostly strong expressions, so subtle sadness tends to read as neutral.
-Fine-tuning on a few hundred frames of your own face fixes this:
+The project also includes a custom data collection script (`capture.py`) that allows users to capture images of their own facial expressions for additional model training.
 
-```bash
-uv run python -m expression.capture     # h/s/n to record happy/sad/neutral, space to stop, q to quit
-uv run python -m expression.finetune    # writes checkpoints/personal.pt only if it beats best.pt on held-out sessions
-uv run python -m expression.predict --webcam   # uses personal.pt automatically
-```
-
-Record each expression in 3+ short sessions (vary head angle and lighting) using the natural expressions you want
-recognised. Frames are saved to `data/personal/` (git-ignored).
+This was introduced to address weaker performance when recognising **sad expressions**, allowing additional examples to be collected to help improve classification accuracy for this class.
 
 ## Project Structure
 
@@ -47,10 +39,8 @@ recognised. Frames are saved to `data/personal/` (git-ignored).
 | `src/expression/data.py` | Dataset filtering, label mapping and image transformations |
 | `src/expression/model.py` | Model architecture and checkpoint loading |
 | `src/expression/train.py` | Training pipeline and test-set evaluation |
-| `src/expression/camera.py` | Face detection/cropping and webcam handling |
-| `src/expression/capture.py` | Record labelled frames of your own face |
-| `src/expression/finetune.py` | Adapt the model to your recorded frames |
 | `src/expression/predict.py` | Face detection and expression prediction for images or webcam feeds |
+| `src/expression/capture.py` | Capture custom facial expression images for additional training and improving underperforming classes |
 
 ## Technologies
 
