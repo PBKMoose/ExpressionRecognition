@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from .camera import face_crops, webcam_frames
+from .camera import crop_face, detect_faces, face_crops, webcam_frames
 from .config import BEST_CHECKPOINT, CLASSES, FACE_SIZE, PERSONAL_CHECKPOINT, get_device
 from .data import eval_transform
 from .model import load_trained
@@ -47,35 +47,89 @@ class ExpressionRecognizer:
         return [(box, self.classify_face(face)) for box, face in face_crops(bgr)]
 
 
-COLOURS = {"happy": (0, 200, 0), "sad": (220, 120, 0), "neutral": (180, 180, 180)}  # BGR
+COLOURS = {"happy": (60, 200, 60), "sad": (230, 140, 30), "neutral": (170, 170, 170)}  # BGR
+FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# Bar panel layout (pixels).
+BAR_W, BAR_H, BAR_GAP, NAME_W, PAD = 240, 30, 10, 105, 12
+
+
+def put_text(img, text, org, scale, colour=(255, 255, 255), thickness=2):
+    """White text with a dark outline so it stays readable on any background."""
+    cv2.putText(img, text, org, FONT, scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+    cv2.putText(img, text, org, FONT, scale, colour, thickness, cv2.LINE_AA)
 
 
 def draw(bgr, results):
+    H, W = bgr.shape[:2]
     for (x0, y0, x1, y1), probs in results:
         label = max(probs, key=probs.get)
-        colour = COLOURS.get(label, (0, 200, 0))
-        cv2.rectangle(bgr, (x0, y0), (x1, y1), colour, 2)
-        cv2.putText(bgr, f"{label} {probs[label]:.0%}", (x0, y0 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.7, colour, 2)
-        # A bar per class so you can see how close the runner-up is.
+        colour = COLOURS.get(label, (60, 200, 60))
+
+        # Thick face box, scaled with face size.
+        thick = max(5, (x1 - x0) // 35)
+        cv2.rectangle(bgr, (x0, y0), (x1, y1), colour, thick, cv2.LINE_AA)
+
+        # Solid label tag above the box (inside it if there's no room above).
+        tag = f"{label.upper()} {probs[label]:.0%}"
+        (tw, th), _ = cv2.getTextSize(tag, FONT, 1.1, 3)
+        ty = y0 - thick // 2 - th - 16 if y0 - th - 16 - thick > 0 else y0 + thick
+        cv2.rectangle(bgr, (x0 - thick // 2, ty), (x0 + tw + 20, ty + th + 16), colour, -1)
+        cv2.putText(bgr, tag, (x0 + 10, ty + th + 8), FONT, 1.1, (0, 0, 0), 3, cv2.LINE_AA)
+
+        # Probability panel: a full-length track per class, filled to its probability.
+        n = len(probs)
+        pw = PAD * 2 + NAME_W + BAR_W
+        ph = PAD * 2 + n * BAR_H + (n - 1) * BAR_GAP
+        # Prefer below the box; otherwise beside it (right, then left), so it doesn't cover the face.
+        px, py = min(max(0, x0), max(0, W - pw)), y1 + thick + 10
+        if py + ph > H:
+            py = min(max(0, y0), max(0, H - ph))
+            if x1 + thick + 10 + pw <= W:
+                px = x1 + thick + 10
+            elif x0 - thick - 10 - pw >= 0:
+                px = x0 - thick - 10 - pw
+            else:
+                py = max(0, H - ph)
+        panel = bgr[py:py + ph, px:px + pw]
+        panel[:] = (panel * 0.3).astype(panel.dtype)  # darken behind the bars
+
         for i, (name, p) in enumerate(probs.items()):
-            y = y1 + 20 + i * 22
-            c = COLOURS.get(name, (0, 200, 0))
-            cv2.rectangle(bgr, (x0, y - 12), (x0 + int(150 * p), y + 4), c, -1)
-            cv2.putText(bgr, f"{name} {p:.0%}", (x0 + 155, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, c, 1)
+            c = COLOURS.get(name, (60, 200, 60))
+            by = py + PAD + i * (BAR_H + BAR_GAP)
+            bx = px + PAD + NAME_W
+            put_text(bgr, name, (px + PAD, by + BAR_H - 8), 0.75, c if name != label else (255, 255, 255))
+            cv2.rectangle(bgr, (bx, by), (bx + BAR_W, by + BAR_H), (70, 70, 70), -1)  # track
+            cv2.rectangle(bgr, (bx, by), (bx + int(BAR_W * p), by + BAR_H), c, -1)  # fill
+            if name == label:
+                cv2.rectangle(bgr, (bx - 2, by - 2), (bx + BAR_W + 2, by + BAR_H + 2), (255, 255, 255), 2)
+            put_text(bgr, f"{p:.0%}", (bx + BAR_W - 62, by + BAR_H - 8), 0.7)
     return bgr
 
 
-def run_webcam(rec: ExpressionRecognizer, camera: int):
-    smoothed = None
+def run_webcam(rec: ExpressionRecognizer, camera: int, hold_frames: int = 10):
+    """Track the largest face, smoothing its box and probabilities so the overlay is steady."""
+    box = probs = None
+    missed = 0
     for frame in webcam_frames(camera):
-        results = rec.analyse(frame)
-        if len(results) == 1:
-            # Smooth over frames to stop the label flickering (single-face case).
-            box, probs = results[0]
-            smoothed = {k: 0.7 * smoothed.get(k, v) + 0.3 * v for k, v in probs.items()} if smoothed else probs
-            results = [(box, smoothed)]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = detect_faces(gray)
+        if faces:
+            missed = 0
+            new_box, face = crop_face(gray, faces[0])  # largest face only
+            new_probs = rec.classify_face(face)
+            if box is None:
+                box, probs = new_box, new_probs
+            else:
+                # Exponential moving averages: box glides instead of jittering, label doesn't flicker.
+                box = tuple(int(0.6 * b + 0.4 * n) for b, n in zip(box, new_box))
+                probs = {k: 0.7 * probs[k] + 0.3 * v for k, v in new_probs.items()}
         else:
-            smoothed = None
+            # Detector misses the odd frame; keep showing the last result briefly instead of blinking.
+            missed += 1
+            if missed > hold_frames:
+                box = probs = None
+        results = [(box, probs)] if box is not None else []
         cv2.imshow("Expression recognition (q to quit)", draw(frame, results))
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
